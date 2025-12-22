@@ -18,6 +18,16 @@ class TunnelGLSurfaceView(context: Context) : GLSurfaceView(context) {
         renderMode = RENDERMODE_CONTINUOUSLY
     }
 
+    override fun onTouchEvent(event: android.view.MotionEvent): Boolean {
+        if (event.action == android.view.MotionEvent.ACTION_DOWN) {
+            queueEvent {
+                renderer.resetRotation()
+            }
+            return true
+        }
+        return super.onTouchEvent(event)
+    }
+
     fun startAudio() {
         audioCapture = AudioCapture { samples ->
             val audioData = analyzer.analyze(samples)

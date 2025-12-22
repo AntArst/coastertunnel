@@ -11,6 +11,8 @@ uniform float uBands[32]; // Increased to 32
 uniform vec2 uResolution;
 uniform sampler2D uAudioHistory;
 uniform float uOffset;
+uniform float uRotation;
+uniform float uStarTime;
 
 const float PI = 3.14159265359;
 const float TAU = 6.28318530718;
@@ -90,21 +92,21 @@ vec3 frequency_lines(float angle, float depth, float r, float time) {
     
     float band_val_now = get_band(band_idx);
     float history_val = get_history(band_idx, r);
-    // Map band index to wave frequency (pitch representation)
-    // Bass (low index) = wide waves (low spatial freq)
-    // Treble (high index) = tight waves (high spatial freq)
-    float wave_spatial_freq = 10.0 + float(band_idx) * 2.5;
-    float wave_speed = 5.0 + float(band_idx) * 0.5;
-
+    // Traffic + Pitch Visualization
+    // 1. Pitch drives the Wave Frequency (Sine Carrier)
+    float wave_spatial_freq = 15.0 + float(band_idx) * 4.0; // Higher pitch = tighter waves
+    float wave_speed = 8.0 + float(band_idx) * 3.0;         // Higher pitch = faster waves
     float travel = r * wave_spatial_freq - time * wave_speed;
     float carrier = sin(travel);
     
-    float displacement = carrier * history_val * 0.5;
+    // 2. Traffic (Amplitude History) drives the Wave Amplitude (Displacement)
+    // Low history = straight line. High history = wide waving.
+    float displacement = carrier * history_val * 0.15;
     
     float dist_from_wave = abs(angle_diff - displacement);
     
-    // Thinner lines for higher resolution
-    float line_width = 0.01 + band_val_now * 0.05; 
+    // 3. Intensity drives Thickness
+    float line_width = 0.005 + band_val_now * 0.08; 
     float line_intensity = smoothstep(line_width, 0.0, dist_from_wave);
     
     float hue = float(band_idx) / num_bands;
@@ -124,8 +126,9 @@ vec3 frequency_lines(float angle, float depth, float r, float time) {
 }
 
 vec3 star_layer(vec2 uv, float time, float scale) {
-    float speed = 0.2 + audio_energy() * 0.5;
-    vec2 moving_uv = uv + vec2(0.0, time * speed);
+    // Speed is now handled by uStarTime accumulation in Kotlin
+    // We just use 'time' (which will be uStarTime) directly
+    vec2 moving_uv = uv + vec2(0.0, time);
     vec2 id = floor(moving_uv * scale);
     vec2 rect = fract(moving_uv * scale) - 0.5;
     vec2 rnd = hash22(id);
@@ -146,8 +149,10 @@ vec3 warp_stars(vec2 uv, float time) {
     float r = length(centered);
     float a = atan(centered.y, centered.x) / TAU + 0.5;
     float z = 1.0 / max(r, 0.001);
-    float speed = 0.5 + uAudio.x * 12.0;
-    vec2 uv_map = vec2(a * 8.0, z - time * speed);
+    
+    // Use uStarTime directly for Z movement (Reversed direction: + instead of -)
+    vec2 uv_map = vec2(a * 8.0, z + time);
+    
     vec3 col = star_layer(uv_map, time * 0.0, 1.0);
     col += star_layer(uv_map + vec2(0.5, 0.5), time * 0.0, 2.0) * 0.5;
     col *= smoothstep(0.0, 2.0, z);
@@ -160,11 +165,19 @@ void main() {
     vec2 centered = uv - 0.5;
     centered.x *= uResolution.x / uResolution.y;
     float r = length(centered);
+    
+    // Apply Rotation - "Just the origin"
+    // Twist the center, fade out rotation towards edges
     float a = atan(centered.y, centered.x);
+    a += uRotation * smoothstep(1.0, 0.0, r);
+    
     vec3 color = vec3(0.0, 0.0, 0.02);
     float depth = 0.5 / max(r, 0.001);
     color += frequency_lines(a, depth, r, uTime);
-    color += warp_stars(uv, uTime);
+    
+    // Use uStarTime for stars
+    color += warp_stars(uv, uStarTime);
+    
     float core_radius = 0.05 + uAudio.x * 0.05;
     float core_glow = 0.02 / abs(r - core_radius * 0.5);
     color += vec3(1.0, 0.8, 0.5) * core_glow * smoothstep(0.5, 0.0, r);

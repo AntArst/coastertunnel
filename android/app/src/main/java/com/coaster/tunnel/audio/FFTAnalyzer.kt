@@ -12,7 +12,9 @@ class FFTAnalyzer {
         val mids: Float,
         val treble: Float,
         val amplitude: Float,
-        val bands: FloatArray // 32 bands
+        val bands: FloatArray, // 32 bands
+        val bpm: Float,
+        val isBeat: Boolean
     )
 
     // Intermediate buffers
@@ -27,6 +29,13 @@ class FFTAnalyzer {
     private var smoothTreble = 0.0f
     private val smoothBands = FloatArray(32)
 
+    // Beat Detection
+    private val energyHistory = FloatArray(43) // ~1 second at 43Hz (approx frame rate calls)
+    private var historyCursor = 0
+    private var lastBeatTime = 0L
+    private var currentBpm = 120.0f
+    private val beatIntervals = mutableListOf<Long>()
+    
     init {
         // Hann window
         for (i in 0 until fftSize) {
@@ -112,7 +121,49 @@ class FFTAnalyzer {
         val treble = (20..31).map { smoothBands[it] }.average().toFloat()
         val amplitude = (bass + mids + treble) / 3f
 
-        return AudioBands(bass, mids, treble, amplitude, smoothBands.clone())
+        // Beat Detection
+        // Use instantaneous bass energy for detection
+        val instantBass = (0..3).map { rawBands[it] }.average().toFloat()
+        
+        // Update history
+        energyHistory[historyCursor] = instantBass
+        historyCursor = (historyCursor + 1) % energyHistory.size
+        
+        val localAvg = energyHistory.average().toFloat()
+        val variance = energyHistory.map { (it - localAvg).pow(2) }.average().toFloat()
+        val c = (-0.0025714 * variance) + 1.5142857 // Linear regression based dynamic threshold multiplier
+        
+        val threshold = localAvg * c
+        val now = System.currentTimeMillis()
+        var isBeat = false
+        
+        if (instantBass > threshold && instantBass > 0.1) {
+            if (now - lastBeatTime > 250) { // Max 240 BPM
+                isBeat = true
+                
+                // BPM calc
+                if (lastBeatTime > 0) {
+                    val interval = now - lastBeatTime
+                    beatIntervals.add(interval)
+                    if (beatIntervals.size > 8) beatIntervals.removeAt(0)
+                    
+                    val avgInterval = beatIntervals.average()
+                    if (avgInterval > 0) {
+                        val newBpm = (60000.0 / avgInterval).toFloat()
+                        // Smooth BPM update
+                        currentBpm = currentBpm * 0.9f + newBpm * 0.1f
+                    }
+                }
+                lastBeatTime = now
+            }
+        }
+        // Decay BPM if silence
+        if (now - lastBeatTime > 2000) {
+           currentBpm = currentBpm * 0.99f 
+           if (currentBpm < 60f) currentBpm = 60f
+        }
+
+        return AudioBands(bass, mids, treble, amplitude, smoothBands.clone(), currentBpm, isBeat)
     }
 
     private fun freqToBin(freq: Float): Int {

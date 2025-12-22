@@ -26,10 +26,26 @@ class TunnelRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var uResLoc: Int = -1
     private var uHistLoc: Int = -1
     private var uOffsetLoc: Int = -1
+    private var uRotationLoc: Int = -1
+    private var uStarTimeLoc: Int = -1
 
     private var startTime: Long = 0
     private var currentAudioData: FFTAnalyzer.AudioBands? = null
     
+    // Rotation State
+    private var currentRotation: Float = 0f
+    private var rotationDirection: Float = 1f
+    private var lastBpm: Float = 120f
+    
+    fun resetRotation() {
+        currentRotation = 0f
+        rotationDirection = 1f
+    }
+    
+    // Star Time (Independent of real time, driven by BPM)
+    private var starTime: Float = 0f
+    private var lastFrameTime: Long = 0
+
     // History Texture
     private val historyWidth = 512
     private val historyHeight = 8 // 32 bands packed into 8 rows
@@ -46,6 +62,7 @@ class TunnelRenderer(private val context: Context) : GLSurfaceView.Renderer {
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         Log.d("TunnelRenderer", "onSurfaceCreated")
         startTime = System.currentTimeMillis()
+        lastFrameTime = startTime
         
         try {
             val vertexShader = loadShader(GLES30.GL_VERTEX_SHADER, R.raw.tunnel_vert)
@@ -68,6 +85,8 @@ class TunnelRenderer(private val context: Context) : GLSurfaceView.Renderer {
             uResLoc = GLES30.glGetUniformLocation(program, "uResolution")
             uHistLoc = GLES30.glGetUniformLocation(program, "uAudioHistory")
             uOffsetLoc = GLES30.glGetUniformLocation(program, "uOffset")
+            uRotationLoc = GLES30.glGetUniformLocation(program, "uRotation")
+            uStarTimeLoc = GLES30.glGetUniformLocation(program, "uStarTime")
 
             Log.d("TunnelRenderer", "Uniform locations: time=$uTimeLoc, res=$uResLoc, bands=$uBandsLoc")
 
@@ -122,6 +141,12 @@ class TunnelRenderer(private val context: Context) : GLSurfaceView.Renderer {
     fun updateAudioData(data: FFTAnalyzer.AudioBands) {
         currentAudioData = data
         
+        // Check for significant tempo change to reverse spin
+        if (Math.abs(data.bpm - lastBpm) > 5.0f) {
+            rotationDirection *= -1f
+            lastBpm = data.bpm
+        }
+        
         // Update history texture
         // 32 bands packed into 8 rows (RGBA)
         
@@ -148,11 +173,24 @@ class TunnelRenderer(private val context: Context) : GLSurfaceView.Renderer {
     }
 
     override fun onDrawFrame(gl: GL10?) {
+        val now = System.currentTimeMillis()
+        val dt = (now - lastFrameTime) / 1000.0f
+        lastFrameTime = now
+        
+        // Accumulate Star Time and Rotation based on BPM
+        val bpm = currentAudioData?.bpm ?: 120.0f
+        val speedFactor = bpm / 60.0f // 1.0 at 60BPM, 2.0 at 120BPM
+        
+        starTime += dt * speedFactor
+        currentRotation += dt * speedFactor * 0.5f * rotationDirection // 0.5 rad/s base speed
+        
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT or GLES30.GL_DEPTH_BUFFER_BIT)
         GLES30.glUseProgram(program)
         
-        val time = (System.currentTimeMillis() - startTime) / 1000.0f
+        val time = (now - startTime) / 1000.0f
         GLES30.glUniform1f(uTimeLoc, time)
+        GLES30.glUniform1f(uStarTimeLoc, starTime)
+        GLES30.glUniform1f(uRotationLoc, currentRotation)
         
         currentAudioData?.let { data ->
             GLES30.glUniform3f(uAudioLoc, data.bass, data.mids, data.treble)
