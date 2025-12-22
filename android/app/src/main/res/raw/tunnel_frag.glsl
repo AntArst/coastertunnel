@@ -90,7 +90,13 @@ vec3 frequency_lines(float angle, float depth, float r, float time) {
     
     float band_val_now = get_band(band_idx);
     float history_val = get_history(band_idx, r);
-    float travel = r * 20.0 - time * 10.0;
+    // Map band index to wave frequency (pitch representation)
+    // Bass (low index) = wide waves (low spatial freq)
+    // Treble (high index) = tight waves (high spatial freq)
+    float wave_spatial_freq = 10.0 + float(band_idx) * 2.5;
+    float wave_speed = 5.0 + float(band_idx) * 0.5;
+
+    float travel = r * wave_spatial_freq - time * wave_speed;
     float carrier = sin(travel);
     
     float displacement = carrier * history_val * 0.5;
