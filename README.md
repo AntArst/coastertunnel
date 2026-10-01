@@ -2,6 +2,8 @@
 
 An immersive Android application that creates a real-time audio-reactive tunnel visualization. The app captures microphone audio, performs FFT analysis to extract frequency bands, and renders a dynamic tunnel effect using OpenGL ES 3.0 shaders.
 
+**Try it in your browser:** [micronant.com/coastertunnel](https://micronant.com/coastertunnel/) runs these same shaders in WebGL2, with the analyser ported to JavaScript, a synthesized demo beat and an optional microphone mode.
+
 ## Overview
 
 CoasterTunnel transforms audio input into a mesmerizing visual experience. As you play music or make sounds, the app analyzes the audio spectrum in real-time and renders colorful frequency lines that spiral through a tunnel-like space, creating a "warp speed" effect synchronized with the audio.
@@ -16,6 +18,7 @@ CoasterTunnel transforms audio input into a mesmerizing visual experience. As yo
   - Smooth attack/decay envelope for fluid visual transitions
 - **Fullscreen Immersive Experience**: Landscape orientation with hidden system UI
 - **Audio History Tracking**: Maintains a rolling history texture for temporal effects
+- **Beat and Tempo Detection**: Bass energy against a threshold that adapts to recent variance gives a beat flag and a smoothed BPM. Starfield speed and tunnel rotation follow the tempo, and the spin reverses when the tempo changes by more than 5 BPM; a tap resets it
 - **High Performance**: Optimized OpenGL ES 3.0 rendering with efficient shader code
 
 ## Requirements
@@ -48,7 +51,7 @@ CoasterTunnel transforms audio input into a mesmerizing visual experience. As yo
    ```bash
    ./build_android.sh
    ```
-   Note: The build script includes a device-specific launch command. Modify the `adb -s` device ID in `build_android.sh` for your device.
+   With more than one device attached, set `ANDROID_SERIAL` to choose which one the script launches on.
 
 4. Grant microphone permission when prompted on first launch.
 
@@ -192,3 +195,6 @@ flowchart TB
 - **Min SDK**: 26
 - **Target SDK**: 34
 
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
