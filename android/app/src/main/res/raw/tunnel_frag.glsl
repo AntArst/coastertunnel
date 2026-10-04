@@ -4,18 +4,25 @@ precision highp float;
 in vec2 vUv;
 out vec4 fragColor;
 
+// uTime is wrapped to [0, TAU) on the CPU so it never loses precision. Every
+// use of it must therefore be periodic in TAU: multiply it by whole numbers only.
 uniform float uTime;
 uniform vec3 uAudio; // bass, mids, treble
-uniform float uBands[32]; // Increased to 32
+uniform float uBands[32];
 
 uniform vec2 uResolution;
 uniform sampler2D uAudioHistory;
-uniform float uOffset;
-uniform float uRotation;
-uniform float uStarTime;
+uniform float uOffset;     // history ring-buffer read head, already on a texel centre
+uniform float uRotation;   // rigid spin, wrapped to [0, TAU)
+uniform float uSpinVel;    // smoothed spin velocity (rad/s), bends the lines into a lean
+uniform float uStarTime;   // star/ring travel, wrapped to [0, STAR_PERIOD)
+uniform float uSpeed;      // tempo factor, 1.0 at 60 BPM
+uniform float uBeatAge;    // seconds since the last detected beat
 
 const float PI = 3.14159265359;
 const float TAU = 6.28318530718;
+const float NUM_BANDS = 32.0;
+const float STAR_PERIOD = 256.0; // must match TunnelRenderer.STAR_PERIOD
 
 // Fast pseudo-random hash
 float hash21(vec2 p) {
@@ -30,159 +37,179 @@ vec2 hash22(vec2 p) {
     return fract((p3.xx + p3.yz) * p3.zy);
 }
 
-// HSV to RGB conversion
-vec3 hsv_to_rgb(vec3 hsv) {
-    float h = hsv.x * 6.0;
-    float s = hsv.y;
-    float v = hsv.z;
-    float i = floor(h);
-    float f = h - i;
-    float p = v * (1.0 - s);
-    float q = v * (1.0 - s * f);
-    float t = v * (1.0 - s * (1.0 - f));
-    int ii = int(i) % 6;
-    if (ii == 0) return vec3(v, t, p);
-    if (ii == 1) return vec3(q, v, p);
-    if (ii == 2) return vec3(p, v, t);
-    if (ii == 3) return vec3(p, q, v);
-    if (ii == 4) return vec3(t, p, v);
-    return vec3(v, p, q);
+// Smooth spectral hue: a cubic-eased HSV wheel at full saturation and value,
+// which avoids the bright creases plain HSV has at the primaries.
+vec3 spectrum(float h) {
+    vec3 c = clamp(abs(mod(h * 6.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
+    return c * c * (3.0 - 2.0 * c);
 }
 
-float get_band(int i) {
-    if (i >= 0 && i < 32) return uBands[i];
-    return 0.0;
+// Coverage of a line of half-width w at distance d, anti-aliased over one pixel.
+// Lines thinner than a pixel keep their width at one pixel and dim instead, so
+// they fade out rather than breaking up into dotted, shimmering fragments.
+float line_cover(float d, float w, float px) {
+    float wa = max(w, px * 0.5);
+    return (w / wa) * (1.0 - smoothstep(wa - px * 0.5, wa + px * 0.5, d));
 }
 
 float get_history(int band, float r) {
-    float history_scale = 1.0;
-    float u = fract(uOffset - r * 0.1); 
-    
+    float u = fract(uOffset - r * 0.1);
     // 32 bands packed into 8 rows of 4 channels
-    int row_idx = band / 4;
-    int channel_idx = band % 4;
-    
-    // Center of pixel row (texture height is 8)
-    float v = (float(row_idx) + 0.5) / 8.0;
-    
-    vec4 val_vec = texture(uAudioHistory, vec2(u, v));
-    if (channel_idx == 0) return val_vec.r;
-    if (channel_idx == 1) return val_vec.g;
-    if (channel_idx == 2) return val_vec.b;
-    return val_vec.a;
+    float v = (float(band / 4) + 0.5) / 8.0;
+    // Two taps half a texel apart smooth the corners that plain linear
+    // filtering leaves between audio frames, which show as kinks in the lines
+    float texel_w = 1.0 / float(textureSize(uAudioHistory, 0).x);
+    vec4 texel = texture(uAudioHistory, vec2(u - 0.5 * texel_w, v))
+               + texture(uAudioHistory, vec2(u + 0.5 * texel_w, v));
+    return 0.5 * dot(texel, vec4(equal(ivec4(band % 4), ivec4(0, 1, 2, 3))));
 }
 
-float audio_energy() {
-    return (uAudio.x * 2.0 + uAudio.y * 1.5 + uAudio.z) / 4.5;
-}
+// One coloured line per band, rippling with that band's recent history. The
+// pixel's own sector and both neighbours are evaluated so that wide lines and
+// their glow cross sector borders instead of being clipped by them.
+vec3 frequency_lines(float angle, float r, float px, float time) {
+    float f = fract(1.25 - angle / TAU) * NUM_BANDS;
+    float idx_f = floor(f);
+    float angle_diff = f - idx_f - 0.5;     // [-0.5, 0.5] across the sector
+    float sector = TAU * r / NUM_BANDS;     // arc length of one sector
 
-vec3 frequency_lines(float angle, float depth, float r, float time) {
     vec3 color = vec3(0.0);
-    float shifted_angle = angle - PI/2.0;
-    float norm_angle = fract(1.0 - shifted_angle / TAU);
-    float num_bands = 32.0; // Increased to 32
-    float band_idx_f = floor(norm_angle * num_bands);
-    int band_idx = int(band_idx_f);
-    float band_center = (band_idx_f + 0.5) / num_bands;
-    float sector_width = 1.0 / num_bands;
-    float angle_diff = (norm_angle - band_center) / sector_width;
-    
-    // Wrap around fix for angle diff
-    // Not needed if we use simple sector logic, but let's be safe
-    
-    float band_val_now = get_band(band_idx);
-    float history_val = get_history(band_idx, r);
-    // Traffic + Pitch Visualization
-    // 1. Pitch drives the Wave Frequency (Sine Carrier)
-    float wave_spatial_freq = 15.0 + float(band_idx) * 4.0; // Higher pitch = tighter waves
-    float wave_speed = 8.0 + float(band_idx) * 3.0;         // Higher pitch = faster waves
-    float travel = r * wave_spatial_freq - time * wave_speed;
-    float carrier = sin(travel);
-    
-    // 2. Traffic (Amplitude History) drives the Wave Amplitude (Displacement)
-    // Low history = straight line. High history = wide waving.
-    float displacement = carrier * history_val * 0.15;
-    
-    float dist_from_wave = abs(angle_diff - displacement);
-    
-    // 3. Intensity drives Thickness
-    float line_width = 0.005 + band_val_now * 0.08; 
-    float line_intensity = smoothstep(line_width, 0.0, dist_from_wave);
-    
-    float hue = float(band_idx) / num_bands;
-    
-    float depth_fade = smoothstep(0.0, 5.0, depth) * (1.0 - smoothstep(10.0, 20.0, depth));
-    
-    float brightness = line_intensity * (0.5 + history_val * 5.0);
-    
-    // Different color mapping? 
-    // Hue from 0 to 1 covers Red->Green->Blue->Red
-    // Let's keep simpler HSV
-    color = hsv_to_rgb(vec3(hue, 0.8, 1.0)) * brightness * depth_fade;
-    
-    float core = smoothstep(line_width * 0.2, 0.0, dist_from_wave);
-    color += vec3(1.0) * core * brightness;
-    return color;
+    for (int k = -1; k <= 1; k++) {
+        int band = (int(idx_f) + k + 32) % 32;
+        float fb = float(band);
+        float now = uBands[band];
+        float hist = get_history(band, r);
+
+        // Pitch sets the ripple frequency and speed, recent amplitude its size.
+        // Both speeds are whole numbers so the wave survives uTime wrapping.
+        float spatial = 15.0 + fb * 4.0;
+        float travel = r * spatial - time * (8.0 + fb * 3.0);
+        float amp = hist * 0.22;
+        float disp = sin(travel) * amp;
+
+        // Distance across the line, corrected for the slope of the ripple so
+        // steep sections keep the same thickness as flat ones.
+        float slope = sector * cos(travel) * amp * spatial;
+        float d = abs(angle_diff - float(k) - disp) * sector / sqrt(1.0 + slope * slope);
+
+        // Loudness sets thickness. Widths scale with the sector, so lines
+        // thicken as they approach the viewer.
+        float w = (0.012 + now * 0.05) * sector;
+        float body = line_cover(d, w, px);
+        float hot = line_cover(d, w * 0.3, px);
+
+        // Soft halo, kept inside a third of a sector so neighbours never clip it
+        float glow_len = min(0.004 + now * 0.006, sector * 0.3);
+        float glow = exp(-d / glow_len);
+
+        float energy = 0.35 + hist * 2.6 + now * 0.8;
+        vec3 hue = spectrum(fb / NUM_BANDS);
+        color += hue * (body * 1.2 + glow * 0.22) * energy;
+        color += vec3(1.0) * hot * hist * hist * 1.6;
+    }
+
+    // Fog toward the vanishing point, and ease off slightly at the screen edge
+    float fade = smoothstep(0.035, 0.17, r) * (1.0 - 0.35 * smoothstep(0.45, 0.95, r));
+    return color * fade;
 }
 
-vec3 star_layer(vec2 uv, float time, float scale) {
-    // Speed is now handled by uStarTime accumulation in Kotlin
-    // We just use 'time' (which will be uStarTime) directly
-    vec2 moving_uv = uv + vec2(0.0, time);
-    vec2 id = floor(moving_uv * scale);
-    vec2 rect = fract(moving_uv * scale) - 0.5;
-    vec2 rnd = hash22(id);
-    vec2 offset = (rnd - 0.5) * 0.8;
-    float d = length(rect - offset);
+// Rings of the tunnel wall rushing past at the tempo; brighter on each beat.
+vec3 tunnel_rings(float r, float px, float travel, float beat) {
+    float v = (1.0 / r + travel) * 0.5;
+    float dv_dr = 0.5 / (r * r);
+    float d = abs(fract(v + 0.5) - 0.5) / dv_dr;   // radial distance to the nearest ring
+    float spacing = 1.0 / dv_dr;
+
+    float w = 0.0006 + 0.0035 * r;
+    float body = line_cover(d, w, px);
+    float glow = exp(-d / min(0.02 * r, spacing * 0.2));
+
+    // Fade out where rings bunch up closer than a few pixels apart
+    float density = smoothstep(3.0 * px, 12.0 * px, spacing);
+    float strength = (0.05 + uAudio.x * 0.12 + beat * 0.35) * density;
+    vec3 tint = mix(vec3(0.35, 0.3, 1.0), vec3(1.0, 0.45, 0.8), beat);
+    return tint * (body * 1.4 + glow * 0.35) * strength;
+}
+
+// One layer of stars flying out of the tunnel, streaking radially with speed.
+vec3 star_layer(float s, float r, float px, float travel, float cells, float seed) {
+    vec2 g = vec2(s * cells, 1.0 / r + travel);
+    vec2 id = floor(g);
+    id.y = mod(id.y, STAR_PERIOD);  // seamless when uStarTime wraps
+    id += seed;
+    vec2 q = fract(g) - 0.5 - (hash22(id) - 0.5) * 0.5;
+
+    // Cell size on screen: tangential and radial
+    vec2 cell = vec2(TAU * r / cells, r * r);
+    vec2 dp = q * cell;
+
     float star_val = hash21(id);
-    float size = 0.05 * star_val * (1.0 + uAudio.z);
-    float glow = 0.05 / (d * 8.0 + 0.01) * smoothstep(1.0, 0.1, d);
-    float core = smoothstep(size, size * 0.5, d);
-    float twinkle = sin(time * 10.0 + star_val * 100.0) * 0.5 + 0.5;
-    float brightness = (core + glow) * twinkle * star_val;
-    float hue = fract(star_val + time * 0.1);
-    return hsv_to_rgb(vec3(hue, 0.5, brightness));
+    float size = (0.0007 + 0.0016 * star_val) * (r * 2.5) * (1.0 + uAudio.z * 0.6);
+    float streak = size * (1.0 + uSpeed * 2.5);
+    // Keep each star well inside its cell so no edges are cut off
+    vec2 radius = min(vec2(size, streak), cell * 0.12);
+    vec2 aa = max(radius, vec2(px * 0.6));
+    float e = length(dp / aa);
+    float energy = (radius.x * radius.y) / (aa.x * aa.y);
+    float shape = exp(-e * e * 2.0) * energy;
+
+    float twinkle = 0.65 + 0.35 * sin(uTime * 3.0 + star_val * 50.0);
+    vec3 tint = mix(vec3(0.7, 0.8, 1.0), spectrum(fract(star_val * 7.0)), 0.35);
+    float visible = step(0.35, star_val);  // thin out the field
+    return tint * shape * twinkle * visible * (1.5 + star_val * 2.5);
 }
 
-vec3 warp_stars(vec2 uv, float time) {
-    vec2 centered = uv - 0.5;
-    float r = length(centered);
-    float a = atan(centered.y, centered.x) / TAU + 0.5;
-    float z = 1.0 / max(r, 0.001);
-    
-    // Use uStarTime directly for Z movement (Reversed direction: + instead of -)
-    vec2 uv_map = vec2(a * 8.0, z + time);
-    
-    vec3 col = star_layer(uv_map, time * 0.0, 1.0);
-    col += star_layer(uv_map + vec2(0.5, 0.5), time * 0.0, 2.0) * 0.5;
-    col *= smoothstep(0.0, 2.0, z);
-    col *= smoothstep(20.0, 5.0, z);
+vec3 warp_stars(float angle, float r, float px, float travel) {
+    float s = fract(angle / TAU);
+    vec3 col = star_layer(s, r, px, travel, 14.0, 0.0);
+    col += star_layer(s, r, px, travel + 0.5, 26.0, 17.0) * 0.6;
+    return col * smoothstep(0.04, 0.2, r);
+}
+
+vec3 core(float r, float px, float beat) {
+    float core_r = 0.038 + uAudio.x * 0.03 + beat * 0.012;
+    vec3 warm = vec3(1.0, 0.72, 0.42);
+    vec3 col = vec3(0.0);
+    // Wide warm halo that breathes with the bass
+    col += warm * 0.03 / (r + 0.03) * exp(-r * 3.5) * (0.6 + uAudio.x * 0.8);
+    // Bright rim, bounded so it never blows up into a singular ring
+    col += mix(warm, vec3(1.0), 0.5) * 0.004 / (abs(r - core_r) + 0.004 + px) * 0.7;
+    // White-hot disc
+    col += vec3(1.0) * (1.0 - smoothstep(core_r * 0.4, core_r + px, r)) * 1.6;
+    // Shockwave on each beat, expanding out of the core
+    float wave_r = core_r + uBeatAge * 0.9;
+    float wave_w = 0.005 + uBeatAge * 0.02;
+    float wave_d = (r - wave_r) / wave_w;
+    float wave = exp(-wave_d * wave_d) * exp(-uBeatAge * 4.0);
+    col += vec3(0.85, 0.6, 1.0) * wave * 0.5;
     return col;
 }
 
 void main() {
-    vec2 uv = vUv;
-    vec2 centered = uv - 0.5;
+    vec2 centered = vUv - 0.5;
     centered.x *= uResolution.x / uResolution.y;
-    float r = length(centered);
-    
-    // Apply Rotation - "Just the origin"
-    // Twist the center, fade out rotation towards edges
+    float r = max(length(centered), 1e-4);
+    float px = 1.0 / uResolution.y;   // one pixel in these units
     float a = atan(centered.y, centered.x);
-    a += uRotation * smoothstep(1.0, 0.0, r);
-    
-    vec3 color = vec3(0.0, 0.0, 0.02);
-    float depth = 0.5 / max(r, 0.001);
-    color += frequency_lines(a, depth, r, uTime);
-    
-    // Use uStarTime for stars
-    color += warp_stars(uv, uStarTime);
-    
-    float core_radius = 0.05 + uAudio.x * 0.05;
-    float core_glow = 0.02 / abs(r - core_radius * 0.5);
-    color += vec3(1.0, 0.8, 0.5) * core_glow * smoothstep(0.5, 0.0, r);
-    color += vec3(1.0) * smoothstep(core_radius, 0.0, r);
-    color *= 1.0 - smoothstep(0.5, 1.5, r);
+    float beat = exp(-uBeatAge * 6.0);
+
+    // Rigid spin, plus a lean toward the spin direction that is strongest at
+    // the centre. The lean follows the velocity, so it stays bounded.
+    float spun = a + uRotation;
+    float lean = clamp(uSpinVel, -3.0, 3.0) * 0.8 * (1.0 - smoothstep(0.0, 0.9, r));
+
+    // Deep-space backdrop that lightens toward the tunnel mouth
+    vec3 color = vec3(0.004, 0.002, 0.018)
+               + vec3(0.02, 0.008, 0.05) * smoothstep(0.1, 1.0, r) * (0.7 + uAudio.y * 0.6);
+
+    color += tunnel_rings(r, px, uStarTime, beat) * smoothstep(0.05, 0.2, r);
+    color += warp_stars(spun, r, px, uStarTime);
+    color += frequency_lines(spun + lean, r, px, uTime);
+    color += core(r, px, beat);
+
+    // Vignette, tone map, then dither to hide 8-bit banding in the dark glows
+    color *= 1.0 - 0.85 * smoothstep(0.55, 1.4, r);
     color = 1.0 - exp(-color);
+    color += (hash21(gl_FragCoord.xy) - 0.5) / 255.0;
     fragColor = vec4(color, 1.0);
 }

@@ -73,6 +73,10 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         glSurfaceView.onResume()
+        // onPause stops the capture, so restart it on the way back or the tunnel freezes
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            startAudio()
+        }
     }
 
     override fun onPause() {

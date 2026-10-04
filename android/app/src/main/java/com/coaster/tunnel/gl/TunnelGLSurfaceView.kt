@@ -28,14 +28,15 @@ class TunnelGLSurfaceView(context: Context) : GLSurfaceView(context) {
         return super.onTouchEvent(event)
     }
 
+    // Safe to call repeatedly: reuses one capture, and start() is a no-op while running
     fun startAudio() {
-        audioCapture = AudioCapture { samples ->
+        val capture = audioCapture ?: AudioCapture { samples ->
             val audioData = analyzer.analyze(samples)
             queueEvent {
                 renderer.updateAudioData(audioData)
             }
-        }
-        audioCapture?.start()
+        }.also { audioCapture = it }
+        capture.start()
     }
 
     override fun onPause() {
@@ -45,6 +46,6 @@ class TunnelGLSurfaceView(context: Context) : GLSurfaceView(context) {
 
     override fun onResume() {
         super.onResume()
-        // Audio will be started by MainActivity after permission check if already granted
+        // Audio is restarted by MainActivity.onResume once the permission is granted
     }
 }

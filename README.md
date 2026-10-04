@@ -12,13 +12,13 @@ CoasterTunnel transforms audio input into a mesmerizing visual experience. As yo
 
 - **Real-time Audio Analysis**: Captures audio at 44.1kHz and performs FFT analysis to extract 32 frequency bands
 - **Dynamic Visualization**: 
-  - Radial frequency lines that oscillate based on audio history
-  - Warp-speed starfield background
-  - Pulsing center core that reacts to bass frequencies
+  - Anti-aliased, glowing radial frequency lines that ripple with audio history
+  - Tunnel rings and a radially streaking starfield that rush past at the tempo
+  - Pulsing center core that reacts to bass, with a shockwave on every beat
   - Smooth attack/decay envelope for fluid visual transitions
 - **Fullscreen Immersive Experience**: Landscape orientation with hidden system UI
 - **Audio History Tracking**: Maintains a rolling history texture for temporal effects
-- **Beat and Tempo Detection**: Bass energy against a threshold that adapts to recent variance gives a beat flag and a smoothed BPM. Starfield speed and tunnel rotation follow the tempo, and the spin reverses when the tempo changes by more than 5 BPM; a tap resets it
+- **Beat and Tempo Detection**: Bass energy against a threshold that adapts to recent variance gives a beat flag and a smoothed BPM. Starfield speed, tunnel rings and rotation follow the tempo. The spin swings round to reverse when a beat shows the tempo has moved by more than 5 BPM (at most once every 2 seconds), and a tap brakes it back to its starting angle
 - **High Performance**: Optimized OpenGL ES 3.0 rendering with efficient shader code
 
 ## Requirements
@@ -117,18 +117,23 @@ flowchart TB
 
 3. **Rendering** (`TunnelRenderer.kt`):
    - Updates a 512x8 RGBA history texture (32 bands packed into 8 rows)
+   - Eases bands toward each new analysis every frame, since audio arrives at about 21 Hz but frames at 60 Hz
    - Passes audio data to shader via uniforms:
-     - `uTime`: Elapsed time
+     - `uTime`: Elapsed time, wrapped to one turn (2π) so it never loses float precision
      - `uAudio`: Bass, mids, treble summary
      - `uBands`: 32-band array
      - `uAudioHistory`: History texture for temporal effects
-     - `uOffset`: Ring buffer head position
+     - `uOffset`: Ring buffer read head, sliding between audio frames
+     - `uRotation`, `uSpinVel`: Wrapped spin angle and its smoothed velocity
+     - `uStarTime`, `uSpeed`: Tempo-driven travel for the stars and rings
+     - `uBeatAge`: Seconds since the last beat, for the beat pulse and shockwave
 
 4. **Visual Effects** (`tunnel_frag.glsl`):
    - **Frequency Lines**: Each of 32 bands maps to a radial sector. Lines oscillate based on audio history, creating a wave that travels outward
-   - **Warp Stars**: Grid-based procedural starfield with audio-reactive speed
-   - **Center Core**: Pulsing white core that expands with bass
-   - **Vignette**: Darkened edges for tunnel effect
+   - **Tunnel Rings**: Perspective rings rushing past at the tempo, flaring on each beat
+   - **Warp Stars**: Grid-based procedural starfield streaking radially with tempo
+   - **Center Core**: Pulsing white core that expands with bass and fires a shockwave on each beat
+   - **Vignette and Dither**: Darkened edges for tunnel effect, dithered to hide 8-bit banding
 
 ## Key Components
 
@@ -166,18 +171,27 @@ flowchart TB
 1. **Radial Frequency Lines**: 
    - Each frequency band occupies a radial sector
    - Lines oscillate using a carrier wave modulated by audio history
-   - Color mapped via HSV (hue based on band index)
-   - Depth-based fade for perspective
+   - Thickness follows loudness and perspective; widths are measured across the ripple, so steep sections don't thin out
+   - Anti-aliased: lines thinner than a pixel dim rather than breaking up into dots
+   - Neighbouring sectors are evaluated too, so wide lines and their glow are never clipped at sector borders
+   - Smooth spectral color (hue based on band index), with white-hot cores where the band is busy
+   - Fogged toward the vanishing point
+   - The spin is rigid, plus a lean in the direction of travel that follows the spin velocity, so it never winds up into a moiré
 
-2. **Warp Starfield**:
-   - Procedural grid-based stars using hash functions
-   - Audio-reactive speed (bass-controlled)
-   - Twinkling effect with time-based modulation
+2. **Tunnel Rings**:
+   - Rings spaced evenly in depth, moving with the tempo
+   - Fade out where they bunch up closer than a few pixels near the center
 
-3. **Center Singularity**:
-   - White core with bass-reactive radius
-   - Glow effect using inverse distance
-   - Creates focal point of the tunnel
+3. **Warp Starfield**:
+   - Procedural grid-based stars using hash functions, aspect-correct and spinning with the tunnel
+   - Stars grow as they approach and streak radially with tempo
+   - Kept inside their grid cells, so none are cut off at cell edges
+   - Brighter and larger with treble, with a gentle twinkle
+
+4. **Center Singularity**:
+   - White core with bass-reactive radius that also pulses on the beat
+   - Warm halo and bounded rim glow
+   - Shockwave ring expanding outward from each beat
 
 ## Development
 
