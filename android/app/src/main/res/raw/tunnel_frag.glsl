@@ -19,6 +19,11 @@ uniform float uStarTime;   // star/ring travel, wrapped to [0, STAR_PERIOD)
 uniform float uSpeed;      // tempo factor, 1.0 at 60 BPM
 uniform float uBeatAge;    // seconds since the last detected beat
 
+// Notes. Each pitch class has a hue on the circle of fifths (see NoteColors.kt)
+uniform sampler2D uNoteHistory; // per band: premultiplied note colour, a = strength
+uniform float uChroma[12];      // how strongly each pitch class sounds, from C
+uniform vec4 uChord;            // blended colour of the sounding notes, a = tonality
+
 const float PI = 3.14159265359;
 const float TAU = 6.28318530718;
 const float NUM_BANDS = 32.0;
@@ -52,8 +57,7 @@ float line_cover(float d, float w, float px) {
     return (w / wa) * (1.0 - smoothstep(wa - px * 0.5, wa + px * 0.5, d));
 }
 
-float get_history(int band, float r) {
-    float u = fract(uOffset - r * 0.1);
+float get_history(int band, float u) {
     // 32 bands packed into 8 rows of 4 channels
     float v = (float(band / 4) + 0.5) / 8.0;
     // Two taps half a texel apart smooth the corners that plain linear
@@ -72,13 +76,21 @@ vec3 frequency_lines(float angle, float r, float px, float time) {
     float idx_f = floor(f);
     float angle_diff = f - idx_f - 0.5;     // [-0.5, 0.5] across the sector
     float sector = TAU * r / NUM_BANDS;     // arc length of one sector
+    float u = fract(uOffset - r * 0.1);     // how far back in history this radius is
+
+    // While music is clearly tonal, colour means a note: lines without a note
+    // of their own fade toward a cool grey and dim. Drums, speech and noise
+    // keep the full rainbow.
+    float base_sat = 1.0 - 0.8 * uChord.a;
 
     vec3 color = vec3(0.0);
     for (int k = -1; k <= 1; k++) {
         int band = (int(idx_f) + k + 32) % 32;
         float fb = float(band);
         float now = uBands[band];
-        float hist = get_history(band, r);
+        float hist = get_history(band, u);
+        // The note sounding in this band when this part of the history was made
+        vec4 note = texture(uNoteHistory, vec2(u, (fb + 0.5) / NUM_BANDS));
 
         // Pitch sets the ripple frequency and speed, recent amplitude its size.
         // Both speeds are whole numbers so the wave survives uTime wrapping.
@@ -102,10 +114,12 @@ vec3 frequency_lines(float angle, float r, float px, float time) {
         float glow_len = min(0.004 + now * 0.006, sector * 0.3);
         float glow = exp(-d / glow_len);
 
-        float energy = 0.35 + hist * 2.6 + now * 0.8;
-        vec3 hue = spectrum(fb / NUM_BANDS);
-        color += hue * (body * 1.2 + glow * 0.22) * energy;
-        color += vec3(1.0) * hot * hist * hist * 1.6;
+        float energy = (0.35 + hist * 2.6 + now * 0.8) * (1.0 - 0.45 * uChord.a * (1.0 - note.a));
+        vec3 band_hue = mix(vec3(0.5, 0.55, 0.7), spectrum(fb / NUM_BANDS), base_sat);
+        vec3 hue = note.rgb + band_hue * (1.0 - note.a);
+        color += hue * (body * 1.2 + glow * (0.22 + note.a * 0.25)) * energy;
+        // White-hot centre, held back on note lines so their colour survives
+        color += vec3(1.0) * hot * hist * hist * 1.6 * (1.0 - 0.75 * note.a);
     }
 
     // Fog toward the vanishing point, and ease off slightly at the screen edge
@@ -128,6 +142,7 @@ vec3 tunnel_rings(float r, float px, float travel, float beat) {
     float density = smoothstep(3.0 * px, 12.0 * px, spacing);
     float strength = (0.05 + uAudio.x * 0.12 + beat * 0.35) * density;
     vec3 tint = mix(vec3(0.35, 0.3, 1.0), vec3(1.0, 0.45, 0.8), beat);
+    tint = mix(tint, uChord.rgb, uChord.a * 0.6);
     return tint * (body * 1.4 + glow * 0.35) * strength;
 }
 
@@ -168,7 +183,8 @@ vec3 warp_stars(float angle, float r, float px, float travel) {
 
 vec3 core(float r, float px, float beat) {
     float core_r = 0.038 + uAudio.x * 0.03 + beat * 0.012;
-    vec3 warm = vec3(1.0, 0.72, 0.42);
+    // Warm by default, taking on the colour of the chord while music is tonal
+    vec3 warm = mix(vec3(1.0, 0.72, 0.42), uChord.rgb * 1.1 + 0.1, uChord.a * 0.65);
     vec3 col = vec3(0.0);
     // Wide warm halo that breathes with the bass
     col += warm * 0.03 / (r + 0.03) * exp(-r * 3.5) * (0.6 + uAudio.x * 0.8);
@@ -183,6 +199,33 @@ vec3 core(float r, float px, float beat) {
     float wave = exp(-wave_d * wave_d) * exp(-uBeatAge * 4.0);
     col += vec3(0.85, 0.6, 1.0) * wave * 0.5;
     return col;
+}
+
+// Twelve arcs around the core, one per pitch class in circle-of-fifths order
+// with C at the top, each lit by how strongly that note is sounding. It stays
+// upright while the tunnel spins so each note keeps its place.
+vec3 note_ring(float angle, float r, float px) {
+    const float RING_R = 0.125;
+    const float HALF_W = 0.0055;
+    float slot = fract(0.25 - angle / TAU) * 12.0;  // clockwise from the top
+    float nearest = floor(slot + 0.5);
+    int fifths = int(mod(nearest, 12.0));
+    float along = abs(slot - nearest);              // 0 at the arc's middle
+
+    // Distance to a rounded arc spanning 76% of its slot
+    float d_along = max(0.0, along - 0.38) * TAU * RING_R / 12.0;
+    float d_across = max(0.0, abs(r - RING_R) - HALF_W);
+    // Dark backing all round, so the arcs read against the core's glow
+    float backing = exp(-d_across / 0.01);
+    float d = length(vec2(d_along, d_across));
+    float body = 1.0 - smoothstep(0.0, px, d);
+    float glow = exp(-d / 0.006);
+
+    // Multiplying by 7 maps a circle-of-fifths position back to a pitch class
+    float level = uChroma[(fifths * 7) % 12];
+    vec3 hue = spectrum(float(fifths) / 12.0);
+    // The ring's outline and backing only appear while music is tonal
+    return hue * (body * (0.06 * uChord.a + level * 2.2) + glow * level * 0.6) - backing * 0.25 * uChord.a;
 }
 
 void main() {
@@ -206,6 +249,7 @@ void main() {
     color += warp_stars(spun, r, px, uStarTime);
     color += frequency_lines(spun + lean, r, px, uTime);
     color += core(r, px, beat);
+    color = max(color + note_ring(a, r, px), 0.0);
 
     // Vignette, tone map, then dither to hide 8-bit banding in the dark glows
     color *= 1.0 - 0.85 * smoothstep(0.55, 1.4, r);

@@ -18,6 +18,7 @@ CoasterTunnel transforms audio input into a mesmerizing visual experience. As yo
   - Smooth attack/decay envelope for fluid visual transitions
 - **Fullscreen Immersive Experience**: Landscape orientation with hidden system UI
 - **Audio History Tracking**: Maintains a rolling history texture for temporal effects
+- **Note Detection and Note Colours**: Picks out the musical notes being played and gives each pitch class its own colour. Lines take the colour of the note sounding in their register, and those colours flow down the tunnel with the history. A ring of twelve arcs around the core shows which notes are sounding, and the core glow takes on the colour of the chord
 - **Beat and Tempo Detection**: Bass energy against a threshold that adapts to recent variance gives a beat flag and a smoothed BPM. Starfield speed, tunnel rings and rotation follow the tempo. The spin swings round to reverse when a beat shows the tempo has moved by more than 5 BPM (at most once every 2 seconds), and a tap brakes it back to its starting angle
 - **High Performance**: Optimized OpenGL ES 3.0 rendering with efficient shader code
 
@@ -66,8 +67,10 @@ CoasterTunnel/
 │   │   │   │   ├── MainActivity.kt              # Entry point, permissions
 │   │   │   │   ├── audio/
 │   │   │   │   │   ├── AudioCapture.kt         # PCM audio capture
-│   │   │   │   │   └── FFTAnalyzer.kt          # FFT analysis, 32-band extraction
+│   │   │   │   │   ├── FFTAnalyzer.kt          # FFT analysis, 32-band extraction
+│   │   │   │   │   └── NoteDetector.kt         # Note detection, chroma
 │   │   │   │   └── gl/
+│   │   │   │       ├── NoteColors.kt           # Note palette, per-band note colours
 │   │   │   │       ├── TunnelGLSurfaceView.kt  # OpenGL ES 3.0 surface
 │   │   │   │       └── TunnelRenderer.kt       # Renderer, shader uniforms
 │   │   │   └── res/raw/
@@ -115,8 +118,16 @@ flowchart TB
    - Applies smoothing with attack/decay envelope (attack: 25.0, decay: 8.0)
    - Extracts summary bands: Bass (0-3), Mids (4-19), Treble (20-31)
 
-3. **Rendering** (`TunnelRenderer.kt`):
+3. **Note Detection** (`NoteDetector.kt`):
+   - Semitones in the bass are only a few hertz apart, much finer than the 21.5 Hz bins of the band FFT, so it keeps its own rolling 8192-sample window (5.4 Hz bins), analysed every hop
+   - Whitens spectral peaks against their neighbourhood so drums and noise count for little
+   - Scores each note from A1 to A7 by summing its first five harmonics. A candidate with no fundamental (pieced together from other notes' overtones) or no overtones (a bare sine, such as a kick drum) scores far lower
+   - Suppresses candidates that are overtones or undertones of a stronger note, preferring the lower octave
+   - Outputs a 12-note chroma, an overall tonality, and the strongest note in each of the 32 bands
+
+4. **Rendering** (`TunnelRenderer.kt`, `NoteColors.kt`):
    - Updates a 512x8 RGBA history texture (32 bands packed into 8 rows)
+   - Updates a matching 512x32 note-colour history texture: one row per band, premultiplied note colour plus strength
    - Eases bands toward each new analysis every frame, since audio arrives at about 21 Hz but frames at 60 Hz
    - Passes audio data to shader via uniforms:
      - `uTime`: Elapsed time, wrapped to one turn (2π) so it never loses float precision
@@ -127,9 +138,12 @@ flowchart TB
      - `uRotation`, `uSpinVel`: Wrapped spin angle and its smoothed velocity
      - `uStarTime`, `uSpeed`: Tempo-driven travel for the stars and rings
      - `uBeatAge`: Seconds since the last beat, for the beat pulse and shockwave
+     - `uNoteHistory`: Note-colour history texture
+     - `uChroma`, `uChord`: How strongly each of the 12 notes sounds, and the chord's blended colour and tonality
 
-4. **Visual Effects** (`tunnel_frag.glsl`):
-   - **Frequency Lines**: Each of 32 bands maps to a radial sector. Lines oscillate based on audio history, creating a wave that travels outward
+5. **Visual Effects** (`tunnel_frag.glsl`):
+   - **Frequency Lines**: Each of 32 bands maps to a radial sector. Lines oscillate based on audio history, creating a wave that travels outward, coloured by the notes sounding in their register
+   - **Note Ring**: Twelve arcs around the core, one per note, lit by how strongly each is sounding
    - **Tunnel Rings**: Perspective rings rushing past at the tempo, flaring on each beat
    - **Warp Stars**: Grid-based procedural starfield streaking radially with tempo
    - **Center Core**: Pulsing white core that expands with bass and fires a shockwave on each beat
@@ -142,6 +156,8 @@ flowchart TB
 | Entry Point | [`MainActivity.kt`](android/app/src/main/java/com/coaster/tunnel/MainActivity.kt) | Handles permissions, fullscreen setup, lifecycle |
 | Audio Capture | [`AudioCapture.kt`](android/app/src/main/java/com/coaster/tunnel/audio/AudioCapture.kt) | PCM audio capture at 44.1kHz, 2048-sample buffers |
 | FFT Analysis | [`FFTAnalyzer.kt`](android/app/src/main/java/com/coaster/tunnel/audio/FFTAnalyzer.kt) | Radix-2 FFT, 32-band logarithmic grouping, smoothing |
+| Note Detection | [`NoteDetector.kt`](android/app/src/main/java/com/coaster/tunnel/audio/NoteDetector.kt) | 8192-sample pitch analysis, chroma, strongest note per band |
+| Note Colours | [`NoteColors.kt`](android/app/src/main/java/com/coaster/tunnel/gl/NoteColors.kt) | Circle-of-fifths palette, per-band note colours, chord colour |
 | GL Surface | [`TunnelGLSurfaceView.kt`](android/app/src/main/java/com/coaster/tunnel/gl/TunnelGLSurfaceView.kt) | OpenGL ES 3.0 context management, audio integration |
 | Renderer | [`TunnelRenderer.kt`](android/app/src/main/java/com/coaster/tunnel/gl/TunnelRenderer.kt) | Shader compilation, uniform updates, history texture |
 | Fragment Shader | [`tunnel_frag.glsl`](android/app/src/main/res/raw/tunnel_frag.glsl) | Visual effect computation (frequency lines, stars, core) |
@@ -188,9 +204,15 @@ flowchart TB
    - Kept inside their grid cells, so none are cut off at cell edges
    - Brighter and larger with treble, with a gentle twinkle
 
-4. **Center Singularity**:
+4. **Note Colours**:
+   - Each pitch class has a hue, laid out around the circle of fifths: C red, G orange, D yellow, A yellow-green, E green, B green-cyan, F♯ cyan, C♯ sky blue, G♯ blue, D♯ violet, A♯ purple, F magenta
+   - Notes that sound well together get neighbouring hues, so a chord reads as one family of colours and a key change shifts the whole palette
+   - While the music is clearly tonal, colour means a note: lines without a note fade to a cool grey. Drums, speech and noise keep the full rainbow
+   - The note ring keeps C at the top with the circle of fifths running clockwise and stays upright while the tunnel spins. It and its backing appear only while the music is tonal
+
+5. **Center Singularity**:
    - White core with bass-reactive radius that also pulses on the beat
-   - Warm halo and bounded rim glow
+   - Warm halo and bounded rim glow, tinted toward the chord's colour
    - Shockwave ring expanding outward from each beat
 
 ## Development
@@ -200,6 +222,15 @@ flowchart TB
 - `androidx.core:core-ktx:1.12.0`
 - `androidx.appcompat:appcompat:1.6.1`
 - `androidx.activity:activity-ktx:1.8.2`
+- `junit:junit:4.13.2` (tests)
+
+### Tests
+
+Unit tests for note detection run on the JVM, no device needed:
+
+```bash
+cd android && ./gradlew test
+```
 
 ### Build Configuration
 

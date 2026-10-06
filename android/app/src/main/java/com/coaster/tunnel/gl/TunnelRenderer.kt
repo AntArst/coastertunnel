@@ -31,6 +31,9 @@ class TunnelRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var uSpinVelLoc: Int = -1
     private var uSpeedLoc: Int = -1
     private var uBeatAgeLoc: Int = -1
+    private var uNoteHistLoc: Int = -1
+    private var uChromaLoc: Int = -1
+    private var uChordLoc: Int = -1
 
     private var currentAudioData: FFTAnalyzer.AudioBands? = null
 
@@ -69,6 +72,12 @@ class TunnelRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var lastHistoryNanos: Long = 0
     private var historyInterval: Float = 2048f / 44100f
 
+    // Notes: per-band colours flow down the tunnel through their own history
+    // texture, alongside the amplitude history; chroma and chord are eased per frame
+    private val noteColors = NoteColors()
+    private val displayChroma = FloatArray(12)
+    private val displayChord = FloatArray(4)
+
     // History Texture
     private val historyWidth = 512
     private val historyHeight = 8 // 32 bands packed into 8 rows
@@ -77,6 +86,12 @@ class TunnelRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private val historyBuffer = ByteBuffer.allocateDirect(historyWidth * historyHeight * 4)
         .order(ByteOrder.nativeOrder())
     private val historyColumn = ByteBuffer.allocateDirect(historyHeight * 4)
+        .order(ByteOrder.nativeOrder())
+
+    // Note colour history: one row per band, premultiplied RGB plus strength
+    private val noteHistoryHeight = 32
+    private val noteHistoryTexture = intArrayOf(0)
+    private val noteColumn = ByteBuffer.allocateDirect(noteHistoryHeight * 4)
         .order(ByteOrder.nativeOrder())
     private var historyOffset = 0
 
@@ -114,6 +129,9 @@ class TunnelRenderer(private val context: Context) : GLSurfaceView.Renderer {
             uSpinVelLoc = GLES30.glGetUniformLocation(program, "uSpinVel")
             uSpeedLoc = GLES30.glGetUniformLocation(program, "uSpeed")
             uBeatAgeLoc = GLES30.glGetUniformLocation(program, "uBeatAge")
+            uNoteHistLoc = GLES30.glGetUniformLocation(program, "uNoteHistory")
+            uChromaLoc = GLES30.glGetUniformLocation(program, "uChroma")
+            uChordLoc = GLES30.glGetUniformLocation(program, "uChord")
 
             Log.d("TunnelRenderer", "Uniform locations: time=$uTimeLoc, res=$uResLoc, bands=$uBandsLoc")
 
@@ -139,6 +157,15 @@ class TunnelRenderer(private val context: Context) : GLSurfaceView.Renderer {
         historyBuffer.position(0)
         
         GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8, historyWidth, historyHeight, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, historyBuffer)
+
+        GLES30.glGenTextures(1, noteHistoryTexture, 0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, noteHistoryTexture[0])
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_REPEAT)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+        val emptyNotes = ByteBuffer.allocateDirect(historyWidth * noteHistoryHeight * 4).order(ByteOrder.nativeOrder())
+        GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8, historyWidth, noteHistoryHeight, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, emptyNotes)
     }
 
     private fun setupQuad() {
@@ -197,6 +224,16 @@ class TunnelRenderer(private val context: Context) : GLSurfaceView.Renderer {
         historyColumn.position(0)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, historyTexture[0])
         GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, historyOffset, 0, 1, historyHeight, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, historyColumn)
+
+        // Note colours go into the same column of their own history texture
+        noteColors.update(data.notes)
+        noteColumn.clear()
+        for (v in noteColors.bandColors) {
+            noteColumn.put((v * 255f).toInt().coerceIn(0, 255).toByte())
+        }
+        noteColumn.position(0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, noteHistoryTexture[0])
+        GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, historyOffset, 0, 1, noteHistoryHeight, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, noteColumn)
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -240,6 +277,9 @@ class TunnelRenderer(private val context: Context) : GLSurfaceView.Renderer {
             displayBass += (data.bass - displayBass) * k
             displayMids += (data.mids - displayMids) * k
             displayTreble += (data.treble - displayTreble) * k
+            val kNotes = 1f - Math.exp(-dt * 10.0).toFloat()
+            for (i in 0 until 12) displayChroma[i] += (data.notes.chroma[i] - displayChroma[i]) * kNotes
+            for (i in 0 until 4) displayChord[i] += (noteColors.chord[i] - displayChord[i]) * kNotes
         }
 
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
@@ -253,6 +293,8 @@ class TunnelRenderer(private val context: Context) : GLSurfaceView.Renderer {
         GLES30.glUniform1f(uBeatAgeLoc, beatAge)
         GLES30.glUniform3f(uAudioLoc, displayBass, displayMids, displayTreble)
         GLES30.glUniform1fv(uBandsLoc, 32, displayBands, 0)
+        GLES30.glUniform1fv(uChromaLoc, 12, displayChroma, 0)
+        GLES30.glUniform4f(uChordLoc, displayChord[0], displayChord[1], displayChord[2], displayChord[3])
 
         GLES30.glUniform2f(uResLoc, viewWidth.toFloat(), viewHeight.toFloat())
 
@@ -266,6 +308,9 @@ class TunnelRenderer(private val context: Context) : GLSurfaceView.Renderer {
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, historyTexture[0])
         GLES30.glUniform1i(uHistLoc, 0)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE1)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, noteHistoryTexture[0])
+        GLES30.glUniform1i(uNoteHistLoc, 1)
 
         GLES30.glBindVertexArray(vao[0])
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)

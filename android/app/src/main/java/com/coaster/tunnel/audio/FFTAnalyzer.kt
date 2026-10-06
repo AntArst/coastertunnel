@@ -14,7 +14,8 @@ class FFTAnalyzer {
         val amplitude: Float,
         val bands: FloatArray, // 32 bands
         val bpm: Float,
-        val isBeat: Boolean
+        val isBeat: Boolean,
+        val notes: NoteDetector.Notes
     )
 
     // Intermediate buffers
@@ -35,6 +36,11 @@ class FFTAnalyzer {
     private var lastBeatTime = 0L
     private var currentBpm = 120.0f
     private val beatIntervals = mutableListOf<Long>()
+
+    // Note detection over the same 60 Hz - 22 kHz log bands
+    private val noteDetector = NoteDetector(sampleRate, FloatArray(33) {
+        exp(ln(60.0) + (ln(22000.0) - ln(60.0)) * it / 32.0).toFloat()
+    })
     
     init {
         // Hann window
@@ -163,7 +169,9 @@ class FFTAnalyzer {
            if (currentBpm < 60f) currentBpm = 60f
         }
 
-        return AudioBands(bass, mids, treble, amplitude, smoothBands.clone(), currentBpm, isBeat)
+        val notes = noteDetector.process(samples)
+
+        return AudioBands(bass, mids, treble, amplitude, smoothBands.clone(), currentBpm, isBeat, notes)
     }
 
     private fun freqToBin(freq: Float): Int {
@@ -175,52 +183,52 @@ class FFTAnalyzer {
         val t = 1.0f - exp(-speed * dt)
         return current + (target - current) * t
     }
+}
 
-    // Standard iterative Radix-2 FFT
-    private fun fft(x: FloatArray, y: FloatArray, n: Int) {
-        var j = 0
-        for (i in 0 until n - 1) {
-            if (i < j) {
-                val tempReal = x[i]
-                x[i] = x[j]
-                x[j] = tempReal
-                val tempImag = y[i]
-                y[i] = y[j]
-                y[j] = tempImag
-            }
-            var k = n / 2
-            while (k <= j) {
-                j -= k
-                k /= 2
-            }
-            j += k
+// Standard iterative Radix-2 FFT, in place; n must be a power of two
+internal fun fft(x: FloatArray, y: FloatArray, n: Int) {
+    var j = 0
+    for (i in 0 until n - 1) {
+        if (i < j) {
+            val tempReal = x[i]
+            x[i] = x[j]
+            x[j] = tempReal
+            val tempImag = y[i]
+            y[i] = y[j]
+            y[j] = tempImag
         }
+        var k = n / 2
+        while (k <= j) {
+            j -= k
+            k /= 2
+        }
+        j += k
+    }
 
-        var m = 2
-        while (m <= n) {
-            val theta = -2.0 * PI / m
-            val wpr = cos(theta).toFloat()
-            val wpi = sin(theta).toFloat()
-            var i = 0
-            while (i < n) {
-                var wr = 1.0f
-                var wi = 0.0f
-                for (k in 0 until m / 2) {
-                    val r = x[i + k + m / 2]
-                    val im = y[i + k + m / 2]
-                    val tr = wr * r - wi * im
-                    val ti = wr * im + wi * r
-                    x[i + k + m / 2] = x[i + k] - tr
-                    y[i + k + m / 2] = y[i + k] - ti
-                    x[i + k] += tr
-                    y[i + k] += ti
-                    val temp = wr
-                    wr = wr * wpr - wi * wpi
-                    wi = temp * wpi + wi * wpr
-                }
-                i += m
+    var m = 2
+    while (m <= n) {
+        val theta = -2.0 * PI / m
+        val wpr = cos(theta).toFloat()
+        val wpi = sin(theta).toFloat()
+        var i = 0
+        while (i < n) {
+            var wr = 1.0f
+            var wi = 0.0f
+            for (k in 0 until m / 2) {
+                val r = x[i + k + m / 2]
+                val im = y[i + k + m / 2]
+                val tr = wr * r - wi * im
+                val ti = wr * im + wi * r
+                x[i + k + m / 2] = x[i + k] - tr
+                y[i + k + m / 2] = y[i + k] - ti
+                x[i + k] += tr
+                y[i + k] += ti
+                val temp = wr
+                wr = wr * wpr - wi * wpi
+                wi = temp * wpi + wi * wpr
             }
-            m *= 2
+            i += m
         }
+        m *= 2
     }
 }
